@@ -81,13 +81,13 @@ drivewm generate \
 Run CogVideoX LoRA training:
 
 ```bash
-scripts/train_cogvideox_lora_nuscenes.sh
+scripts/train.sh
 ```
 
 Run on multiple GPUs with `torchrun`:
 
 ```bash
-GPU_IDS=0,1,2,3 NPROC_PER_NODE=4 scripts/train_cogvideox_lora_nuscenes.sh
+GPU_IDS=0,1,2,3 NPROC_PER_NODE=4 scripts/train.sh
 ```
 
 Override the port or precision when needed:
@@ -95,10 +95,10 @@ Override the port or precision when needed:
 ```bash
 MASTER_PORT=29501 \
 MIXED_PRECISION=bf16 \
-scripts/train_cogvideox_lora_nuscenes.sh
+scripts/train.sh
 ```
 
-There is also a generic experimental training entrypoint:
+There is also a generic experimental training script:
 
 ```bash
 python3 scripts/train_diffusers.py \
@@ -216,17 +216,17 @@ pipeline. The adapter receives a `GenerationRequest` containing:
 
 ## Training
 
-Training is dispatched from config. The shell calls a thin Python entrypoint,
-which reads `dataset.name` from the dataset registry and `model.family` from the
-model trainer registry. The current implemented trainer follows the official
-diffusers CogVideoX LoRA example style:
+Training is controlled by config. The shell calls one Python script, which reads
+`dataset.name` from the dataset config, builds the dataset adapter, and then
+uses one `DriveWorldTrainer`. The trainer reads `model.family` and currently
+supports the official diffusers CogVideoX LoRA path:
 `accelerate`, PyTorch `DataLoader`, `CogVideoXTransformer3DModel`, T5 prompt
 encoding, CogVideoX VAE latent encoding, scheduler noise sampling, LoRA injected
 into transformer attention projections, and a visible training loop. The first
 script is:
 
 ```text
-scripts/train_cogvideox_lora_nuscenes.py
+scripts/train.py
 ```
 
 It loads:

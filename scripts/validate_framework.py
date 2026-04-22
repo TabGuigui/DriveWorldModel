@@ -11,7 +11,7 @@ def main() -> int:
     commands = [
         [sys.executable, "-m", "compileall", "-q", "drivewm"],
         [sys.executable, "-m", "drivewm.cli", "list"],
-        [sys.executable, "-m", "py_compile", "scripts/train_cogvideox_lora_nuscenes.py"],
+        [sys.executable, "-m", "py_compile", "scripts/train.py"],
     ]
     env = {
         **os.environ,

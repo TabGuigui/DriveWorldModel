@@ -19,8 +19,9 @@ class VideoTrainingRecord:
     metadata: dict[str, Any]
 
 
-def load_video_training_records(config: ExperimentConfig) -> list[VideoTrainingRecord]:
-    dataset_cls = DATASETS.get(config.dataset.name)
+def load_video_training_records(config: ExperimentConfig, dataset_cls=None) -> list[VideoTrainingRecord]:
+    if dataset_cls is None:
+        dataset_cls = DATASETS.get(config.dataset.name)
     dataset = dataset_cls(config.dataset)
     records: list[VideoTrainingRecord] = []
     for sample in dataset.iter_samples():

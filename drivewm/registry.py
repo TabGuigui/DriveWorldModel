@@ -43,4 +43,3 @@ class Registry(Generic[T]):
 
 DATASETS: Registry[type] = Registry("dataset")
 MODEL_ADAPTERS: Registry[type] = Registry("model adapter")
-MODEL_TRAINERS: Registry[type] = Registry("model trainer")

@@ -1,4 +1,9 @@
-"""CogVideoX LoRA training implementation."""
+"""Single DriveWorldModel trainer.
+
+The trainer reads dataset and model choices from ExperimentConfig. The first
+supported backend is CogVideoX LoRA; Wan and Hunyuan can be added here without
+adding another trainer abstraction.
+"""
 
 from __future__ import annotations
 
@@ -8,43 +13,46 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+import diffusers
+import numpy as np
+import torch
+import torchvision.transforms as TT
+import transformers
+from accelerate import Accelerator, DeepSpeedPlugin
+from accelerate.logging import get_logger
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from diffusers import AutoencoderKLCogVideoX, CogVideoXDPMScheduler, CogVideoXPipeline, CogVideoXTransformer3DModel
+from diffusers.models.embeddings import get_3d_rotary_pos_embed
+from diffusers.optimization import get_scheduler
+from diffusers.pipelines.cogvideo.pipeline_cogvideox import get_resize_crop_region_for_grid
+from diffusers.training_utils import cast_training_params, free_memory
+from diffusers.utils import convert_unet_state_dict_to_peft, export_to_video
+from diffusers.utils.torch_utils import is_compiled_module
+from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
+from torch.utils.data import DataLoader
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.functional import resize
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, T5EncoderModel
+
 from drivewm.config import ExperimentConfig
-from drivewm.registry import MODEL_TRAINERS
 from drivewm.training.video_dataset import load_video_training_records
 
 logger = logging.getLogger(__name__)
 
 
-@MODEL_TRAINERS.register("cogvideox")
-@MODEL_TRAINERS.register("cogvideox-1.5")
-class CogVideoXLoRATrainer:
-    def __init__(self, config: ExperimentConfig, args=None) -> None:
+class DriveWorldTrainer:
+    def __init__(self, config: ExperimentConfig, args=None, dataset_cls=None) -> None:
         self.config = config
         self.args = args
+        self.dataset_cls = dataset_cls
 
     def train(self) -> None:
-        import numpy as np
-        import torch
-        import torchvision.transforms as TT
-        import transformers
-        from accelerate import Accelerator
-        from accelerate.logging import get_logger
-        from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
-        from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
-        from torch.utils.data import DataLoader
-        from torchvision.transforms import InterpolationMode
-        from torchvision.transforms.functional import resize
-        from tqdm.auto import tqdm
-        from transformers import AutoTokenizer, T5EncoderModel
-
-        import diffusers
-        from diffusers import AutoencoderKLCogVideoX, CogVideoXDPMScheduler, CogVideoXPipeline, CogVideoXTransformer3DModel
-        from diffusers.models.embeddings import get_3d_rotary_pos_embed
-        from diffusers.optimization import get_scheduler
-        from diffusers.pipelines.cogvideo.pipeline_cogvideox import get_resize_crop_region_for_grid
-        from diffusers.training_utils import cast_training_params, free_memory
-        from diffusers.utils import convert_unet_state_dict_to_peft, export_to_video
-        from diffusers.utils.torch_utils import is_compiled_module
+        if self.config.model.family not in {"cogvideox", "cogvideox-1.5"}:
+            raise ValueError(
+                "DriveWorldTrainer currently supports CogVideoX LoRA training. "
+                f"Got model.family={self.config.model.family!r}."
+            )
 
         config = self.config
         training = config.training
@@ -57,12 +65,18 @@ class CogVideoXLoRATrainer:
         logging_dir = output_dir / train_extra.get("logging_dir", "logs")
         accelerator_project_config = ProjectConfiguration(project_dir=str(output_dir), logging_dir=str(logging_dir))
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        deepspeed_plugin = None
+        deepspeed_config = getattr(self.args, "deepspeed_config", None) or train_extra.get("deepspeed_config")
+        if deepspeed_config:
+            deepspeed_plugin = DeepSpeedPlugin(hf_ds_config=str(deepspeed_config))
+
         accelerator = Accelerator(
             gradient_accumulation_steps=training.gradient_accumulation_steps,
             mixed_precision=training.mixed_precision,
             log_with=getattr(self.args, "report_to", None) or train_extra.get("report_to"),
             project_config=accelerator_project_config,
             kwargs_handlers=[ddp_kwargs],
+            deepspeed_plugin=deepspeed_plugin,
         )
 
         logging.basicConfig(
@@ -215,6 +229,7 @@ class CogVideoXLoRATrainer:
             resize_fn=resize,
             interpolation_mode=InterpolationMode,
             tqdm=tqdm,
+            dataset_cls=self.dataset_cls,
         )
 
         def encode_video(video):
@@ -450,6 +465,7 @@ class CogVideoXManifestDataset:
         resize_fn,
         interpolation_mode,
         tqdm,
+        dataset_cls=None,
     ) -> None:
         self.config = config
         self.torch = torch
@@ -464,7 +480,7 @@ class CogVideoXManifestDataset:
         self.skip_frames_start = int(config.training.extra.get("skip_frames_start", 0))
         self.skip_frames_end = int(config.training.extra.get("skip_frames_end", 0))
         self.id_token = config.training.extra.get("id_token", "")
-        self.records = load_video_training_records(config)
+        self.records = load_video_training_records(config, dataset_cls=dataset_cls)
         self.instance_prompts = [self.id_token + record.prompt for record in self.records]
         self.instance_video_paths = [record.target_video for record in self.records]
         self.instance_videos = self._preprocess_data(tqdm)
