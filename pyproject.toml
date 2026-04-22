@@ -1,0 +1,40 @@
+[project]
+name = "drive-world-model"
+version = "0.1.0"
+description = "Integration framework for driving video world models."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+]
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6.0"]
+diffusers = [
+  "accelerate>=0.31",
+  "diffusers>=0.37",
+  "imageio>=2.34",
+  "imageio-ffmpeg>=0.5",
+  "pillow>=10.0",
+  "sentencepiece>=0.2",
+  "torch>=2.3",
+  "transformers>=4.44",
+]
+training = [
+  "accelerate>=0.31",
+  "datasets>=2.20",
+  "decord>=0.6",
+  "diffusers>=0.37",
+  "imageio>=2.34",
+  "imageio-ffmpeg>=0.5",
+  "peft>=0.11",
+  "pillow>=10.0",
+  "sentencepiece>=0.2",
+  "torch>=2.3",
+  "transformers>=4.44",
+]
+
+[project.scripts]
+drivewm = "drivewm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["drivewm*"]

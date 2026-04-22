@@ -1,0 +1,36 @@
+name: nuscenes-hunyuan-history
+
+dataset:
+  name: nuscenes
+  root: examples/nuscenes
+  split: mini
+  camera_names: [CAM_FRONT]
+  history_frames: 4
+  future_steps: 8
+
+conditioning:
+  use_history_images: true
+  use_future_trajectory: false
+
+model:
+  family: hunyuan
+  variant: hunyuanvideo-driving
+  checkpoint: null
+  precision: bf16
+  device: cuda
+  extra:
+    pipeline_class: diffusers:HunyuanVideo15ImageToVideoPipeline
+    history_input_key: image
+    enable_model_cpu_offload: true
+    enable_vae_tiling: true
+
+generation:
+  output_dir: outputs/nuscenes_hunyuan_history
+  num_frames: 16
+  fps: 8
+  width: 832
+  height: 480
+  prompt: "Urban driving scene, realistic dashcam video."
+  num_inference_steps: 30
+  guidance_scale: 6.0
+  max_samples: 1

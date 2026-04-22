@@ -1,0 +1,41 @@
+name: nuplan-wan-history-traj
+
+dataset:
+  name: nuplan
+  root: examples/nuplan
+  split: mini
+  camera_names: [CAM_FRONT]
+  history_frames: 4
+  future_steps: 8
+
+conditioning:
+  use_history_images: true
+  use_future_trajectory: true
+  trajectory_frame: ego
+  trajectory_fields: [x, y, yaw]
+  normalize_trajectory: true
+
+model:
+  family: wan
+  variant: wan2.1-driving
+  checkpoint: null
+  precision: bf16
+  device: cuda
+  extra:
+    pipeline_class: diffusers:WanVideoToVideoPipeline
+    history_input_key: video
+    trajectory_kwarg: driving_trajectory
+    enable_model_cpu_offload: true
+    enable_vae_tiling: true
+
+generation:
+  output_dir: outputs/nuplan_wan_history_traj
+  num_frames: 16
+  fps: 8
+  width: 832
+  height: 480
+  prompt: "Forward-facing autonomous driving video following the planned route."
+  num_inference_steps: 30
+  guidance_scale: 5.0
+  strength: 0.8
+  max_samples: 1

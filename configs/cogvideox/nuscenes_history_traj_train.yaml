@@ -1,0 +1,68 @@
+name: nuscenes-cogvideox-history-traj-train
+
+dataset:
+  name: nuscenes
+  root: examples/nuscenes
+  split: mini
+  camera_names: [CAM_FRONT]
+  history_frames: 4
+  future_steps: 8
+
+conditioning:
+  use_history_images: true
+  use_future_trajectory: true
+  trajectory_frame: ego
+  trajectory_fields: [x, y, yaw]
+  normalize_trajectory: true
+
+model:
+  family: cogvideox
+  variant: THUDM/CogVideoX-2b
+  checkpoint: null
+  precision: bf16
+  device: cuda
+  extra:
+    pipeline_class: diffusers:CogVideoXVideoToVideoPipeline
+    history_input_key: video
+    trajectory_kwarg: driving_trajectory
+    enable_vae_tiling: true
+
+generation:
+  output_dir: outputs/nuscenes_cogvideox_history_traj
+  num_frames: 49
+  fps: 8
+  width: 720
+  height: 480
+  prompt: "Realistic front camera driving video conditioned on past frames and route."
+
+training:
+  output_dir: outputs/train/cogvideox_nuscenes_history_traj
+  train_batch_size: 1
+  num_train_epochs: 1
+  max_train_steps: 10
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  checkpointing_steps: 5
+  mode: full
+  trainable_module: transformer
+  target_video_key: target_video
+  extra:
+    rank: 64
+    lora_alpha: 64
+    target_modules: [to_k, to_q, to_v, to_out.0]
+    gradient_checkpointing: true
+    enable_slicing: true
+    enable_tiling: true
+    lr_scheduler: cosine_with_restarts
+    lr_warmup_steps: 200
+    lr_num_cycles: 1
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_weight_decay: 0.0001
+    video_reshape_mode: center
+    skip_frames_start: 0
+    skip_frames_end: 0
+    tracker_name: drivewm-cogvideox-lora
