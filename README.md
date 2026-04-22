@@ -216,7 +216,10 @@ pipeline. The adapter receives a `GenerationRequest` containing:
 
 ## Training
 
-Training follows the official diffusers CogVideoX LoRA example style:
+Training is dispatched from config. The shell calls a thin Python entrypoint,
+which reads `dataset.name` from the dataset registry and `model.family` from the
+model trainer registry. The current implemented trainer follows the official
+diffusers CogVideoX LoRA example style:
 `accelerate`, PyTorch `DataLoader`, `CogVideoXTransformer3DModel`, T5 prompt
 encoding, CogVideoX VAE latent encoding, scheduler noise sampling, LoRA injected
 into transformer attention projections, and a visible training loop. The first
@@ -228,7 +231,7 @@ scripts/train_cogvideox_lora_nuscenes.py
 
 It loads:
 
-- dataset samples through the same nuScenes/nuPlan adapters.
+- dataset samples through the configured `DATASETS` adapter.
 - target videos from the DriveWorldModel jsonl manifest.
 - `AutoencoderKLCogVideoX`, `CogVideoXTransformer3DModel`,
   `CogVideoXDPMScheduler`, and T5 components from the configured checkpoint.
