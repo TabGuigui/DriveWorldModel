@@ -40,6 +40,28 @@ Install the package in editable mode:
 pip install -e .
 ```
 
+For the tested CUDA 12.1 training stack:
+
+```bash
+pip install -r requirements-cu121.txt
+pip install -e .
+```
+
+If you clone this repository elsewhere, initialize the local diffusers
+submodule before training:
+
+```bash
+git submodule update --init --recursive
+```
+
+This requirements file targets PyTorch `2.3.0+cu121` and CogVideoX LoRA
+training dependencies. Install DeepSpeed separately on Linux CUDA machines if
+you need it:
+
+```bash
+DS_BUILD_OPS=0 pip install "deepspeed>=0.14.4,<0.16"
+```
+
 The built-in config loader supports the simple YAML used by the example files.
 Install `pip install -e ".[yaml]"` if you want full YAML support.
 
