@@ -28,8 +28,9 @@ drivewm/
     wan/                 # Wan model family
     cogvideox/           # CogVideoX model family
     hunyuan/             # HunyuanVideo model family
+    vjepa/               # V-JEPA Hugging Face loading helpers
 configs/                 # Example experiment configs grouped by model family
-examples/                # Tiny manifest examples for dry runs
+examples/                # Tiny manifest examples
 ```
 
 ## Quick Start
@@ -54,9 +55,9 @@ submodule before training:
 git submodule update --init --recursive
 ```
 
-This requirements file targets PyTorch `2.3.0+cu121` and CogVideoX LoRA
-training dependencies. Install DeepSpeed separately on Linux CUDA machines if
-you need it:
+This requirements file targets PyTorch `2.3.0+cu121`, CogVideoX LoRA, and
+Hugging Face V-JEPA 2 training dependencies. Install DeepSpeed separately on
+Linux CUDA machines if you need it:
 
 ```bash
 DS_BUILD_OPS=0 pip install "deepspeed>=0.14.4,<0.16"
@@ -81,13 +82,13 @@ drivewm generate \
 Run CogVideoX LoRA training:
 
 ```bash
-scripts/train.sh
+CONFIG_PATH=configs/cogvideox/nuscenes_history_traj_train.yaml scripts/train.sh
 ```
 
 Run on multiple GPUs with `torchrun`:
 
 ```bash
-GPU_IDS=0,1,2,3 NPROC_PER_NODE=4 scripts/train.sh
+GPU_IDS=0,1,2,3 NPROC_PER_NODE=4 CONFIG_PATH=configs/cogvideox/nuscenes_history_traj_train.yaml scripts/train.sh
 ```
 
 Override the port or precision when needed:
@@ -95,7 +96,7 @@ Override the port or precision when needed:
 ```bash
 MASTER_PORT=29501 \
 MIXED_PRECISION=bf16 \
-scripts/train.sh
+CONFIG_PATH=configs/cogvideox/nuscenes_history_traj_train.yaml scripts/train.sh
 ```
 
 There is also a generic experimental training script:
@@ -257,6 +258,35 @@ training:
 The current script is text/video CogVideoX LoRA fine-tuning. It does not yet
 inject trajectory tensors into the transformer; that should be added after the
 baseline nuScenes video LoRA path is stable.
+
+The default `scripts/train.sh` now points to V-JEPA encoder pretraining:
+
+```bash
+scripts/train.sh
+```
+
+That resolves to:
+
+```bash
+CONFIG_PATH=configs/vjepa/nuplan_encoder_pretrain.yaml
+```
+
+The V-JEPA path now loads the model directly with `VJEPA2Model.from_pretrained(...)`.
+Use a Hugging Face repo id or a local directory in the config:
+
+```yaml
+model:
+  family: vjepa
+  variant: facebook/vjepa2-vitl-fpc64-256
+```
+
+or:
+
+```yaml
+model:
+  family: vjepa
+  checkpoint: /path/to/local/vjepa2
+```
 
 Install training dependencies with:
 

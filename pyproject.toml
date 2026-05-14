@@ -39,7 +39,7 @@ training = [
   "torch>=2.3,<2.4",
   "torchvision>=0.18,<0.19",
   "tqdm>=4.66.0",
-  "transformers>=4.41.2,<4.47",
+  "transformers>=4.53.3,<4.58",
 ]
 
 [project.scripts]

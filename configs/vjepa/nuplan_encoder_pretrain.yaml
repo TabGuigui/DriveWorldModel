@@ -1,0 +1,55 @@
+name: nuplan-vjepa-encoder-pretrain
+
+dataset:
+  name: nuplan
+  root: examples/nuplan
+  split: mini
+  camera_names: [CAM_FRONT]
+
+conditioning:
+  use_history_images: false
+  use_future_trajectory: false
+
+model:
+  family: vjepa
+  variant: facebook/vjepa2-vitl-fpc64-256
+  checkpoint: null
+  precision: bf16
+  device: cuda
+  extra:
+    attn_implementation: sdpa
+
+generation:
+  output_dir: outputs/vjepa_nuplan_encoder
+  num_frames: 64
+  fps: 8
+  width: 256
+  height: 256
+  prompt: ""
+
+training:
+  output_dir: outputs/train/vjepa_nuplan_encoder
+  train_batch_size: 1
+  num_train_epochs: 10
+  max_train_steps: 1000
+  gradient_accumulation_steps: 1
+  learning_rate: 0.00015
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  seed: 42
+  dataloader_num_workers: 4
+  checkpointing_steps: 100
+  mode: encoder_pretrain
+  target_video_key: target_video
+  extra:
+    mask_ratio: 0.8
+    normalize_targets: true
+    random_horizontal_flip: true
+    gradient_checkpointing: true
+    lr_scheduler: cosine
+    lr_warmup_steps: 100
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_weight_decay: 0.05
+    tracker_name: drivewm-vjepa-pretrain

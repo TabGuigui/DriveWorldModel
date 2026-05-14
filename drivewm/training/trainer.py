@@ -16,6 +16,7 @@ from typing import Optional
 import diffusers
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as TT
 import transformers
 from accelerate import Accelerator, DeepSpeedPlugin
@@ -36,6 +37,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, T5EncoderModel
 
 from drivewm.config import ExperimentConfig
+from drivewm.models.vjepa import load_vjepa_components
 from drivewm.training.video_dataset import load_video_training_records
 
 logger = logging.getLogger(__name__)
@@ -48,9 +50,13 @@ class DriveWorldTrainer:
         self.dataset_cls = dataset_cls
 
     def train(self) -> None:
+        if self.config.model.family in {"vjepa", "vjepa-encoder"}:
+            self._train_vjepa_encoder_pretrain()
+            return
+
         if self.config.model.family not in {"cogvideox", "cogvideox-1.5"}:
             raise ValueError(
-                "DriveWorldTrainer currently supports CogVideoX LoRA training. "
+                "DriveWorldTrainer currently supports CogVideoX LoRA and Hugging Face V-JEPA encoder pretrain. "
                 f"Got model.family={self.config.model.family!r}."
             )
 
@@ -454,6 +460,235 @@ class DriveWorldTrainer:
 
         accelerator.end_training()
 
+    def _train_vjepa_encoder_pretrain(self) -> None:
+        config = self.config
+        training = config.training
+        train_extra = training.extra
+        model_extra = config.model.extra
+        hf_logger = get_logger(__name__)
+
+        output_dir = Path(training.output_dir)
+        logging_dir = output_dir / train_extra.get("logging_dir", "logs")
+        accelerator_project_config = ProjectConfiguration(project_dir=str(output_dir), logging_dir=str(logging_dir))
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        deepspeed_plugin = None
+        deepspeed_config = getattr(self.args, "deepspeed_config", None) or train_extra.get("deepspeed_config")
+        if deepspeed_config:
+            deepspeed_plugin = DeepSpeedPlugin(hf_ds_config=str(deepspeed_config))
+
+        accelerator = Accelerator(
+            gradient_accumulation_steps=training.gradient_accumulation_steps,
+            mixed_precision=training.mixed_precision,
+            log_with=getattr(self.args, "report_to", None) or train_extra.get("report_to"),
+            project_config=accelerator_project_config,
+            kwargs_handlers=[ddp_kwargs],
+            deepspeed_plugin=deepspeed_plugin,
+        )
+
+        logging.basicConfig(
+            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+            datefmt="%m/%d/%Y %H:%M:%S",
+            level=logging.INFO,
+        )
+        hf_logger.info(accelerator.state, main_process_only=False)
+        if accelerator.is_local_main_process:
+            transformers.utils.logging.set_verbosity_warning()
+        else:
+            transformers.utils.logging.set_verbosity_error()
+
+        if training.seed is not None:
+            set_seed(training.seed)
+        if accelerator.is_main_process:
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+        weight_dtype = torch.float32
+        if accelerator.mixed_precision == "fp16":
+            weight_dtype = torch.float16
+        elif accelerator.mixed_precision == "bf16":
+            weight_dtype = torch.bfloat16
+        if torch.backends.mps.is_available() and weight_dtype == torch.bfloat16:
+            raise ValueError("MPS does not support bf16 mixed precision; use fp16 or fp32.")
+
+        pretrained = pretrained_model_name_or_path(config)
+        vjepa = load_vjepa_components(config, torch_dtype=weight_dtype)
+        video_processor = vjepa.video_processor
+        model = vjepa.model
+        if train_extra.get("gradient_checkpointing", False) and hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        model.train()
+        model.to(accelerator.device, dtype=weight_dtype)
+
+        params_to_optimize = [
+            {
+                "params": [
+                    param for param in model.parameters() if param.requires_grad
+                ],
+                "lr": training.learning_rate,
+            }
+        ]
+        use_deepspeed_optimizer = (
+            accelerator.state.deepspeed_plugin is not None
+            and "optimizer" in accelerator.state.deepspeed_plugin.deepspeed_config
+        )
+        use_deepspeed_scheduler = (
+            accelerator.state.deepspeed_plugin is not None
+            and "scheduler" in accelerator.state.deepspeed_plugin.deepspeed_config
+        )
+        if use_deepspeed_optimizer:
+            from accelerate.utils import DummyOptim
+
+            optimizer = DummyOptim(
+                params_to_optimize,
+                lr=training.learning_rate,
+                betas=(float(train_extra.get("adam_beta1", 0.9)), float(train_extra.get("adam_beta2", 0.95))),
+                eps=float(train_extra.get("adam_epsilon", 1e-8)),
+                weight_decay=float(train_extra.get("adam_weight_decay", training.weight_decay)),
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                params_to_optimize,
+                betas=(float(train_extra.get("adam_beta1", 0.9)), float(train_extra.get("adam_beta2", 0.95))),
+                eps=float(train_extra.get("adam_epsilon", 1e-8)),
+                weight_decay=float(train_extra.get("adam_weight_decay", training.weight_decay)),
+            )
+
+        train_dataset = VJEPAPretrainDataset(
+            config=config,
+            num_frames=vjepa.frames_per_clip,
+            torch=torch,
+            np=np,
+            tqdm=tqdm,
+            dataset_cls=self.dataset_cls,
+        )
+
+        def collate_fn(examples):
+            pixel_values_videos = []
+            for example in examples:
+                processed = video_processor(example["video"].cpu().numpy(), return_tensors="pt")
+                pixel_values = processed["pixel_values_videos"]
+                if pixel_values.ndim == 5 and pixel_values.shape[0] == 1:
+                    pixel_values = pixel_values[0]
+                pixel_values_videos.append(pixel_values)
+            return {"pixel_values_videos": torch.stack(pixel_values_videos, dim=0)}
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=training.train_batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=training.dataloader_num_workers,
+        )
+
+        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / training.gradient_accumulation_steps)
+        max_train_steps = training.max_train_steps or training.num_train_epochs * num_update_steps_per_epoch
+        num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
+
+        if use_deepspeed_scheduler:
+            from accelerate.utils import DummyScheduler
+
+            lr_scheduler = DummyScheduler(
+                name=train_extra.get("lr_scheduler", "constant"),
+                optimizer=optimizer,
+                total_num_steps=max_train_steps * accelerator.num_processes,
+                num_warmup_steps=int(train_extra.get("lr_warmup_steps", 0)) * accelerator.num_processes,
+            )
+        else:
+            lr_scheduler = get_scheduler(
+                train_extra.get("lr_scheduler", "constant"),
+                optimizer=optimizer,
+                num_warmup_steps=int(train_extra.get("lr_warmup_steps", 0)) * accelerator.num_processes,
+                num_training_steps=max_train_steps * accelerator.num_processes,
+                num_cycles=int(train_extra.get("lr_num_cycles", 1)),
+                power=float(train_extra.get("lr_power", 1.0)),
+            )
+
+        model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, lr_scheduler)
+
+        if accelerator.is_main_process:
+            accelerator.init_trackers(train_extra.get("tracker_name", "drivewm-vjepa-pretrain"), config=flatten_config(config))
+
+        mask_ratio = float(train_extra.get("mask_ratio", 0.8))
+        normalize_targets = bool(train_extra.get("normalize_targets", True))
+        total_batch_size = training.train_batch_size * accelerator.num_processes * training.gradient_accumulation_steps
+        num_trainable_parameters = sum(param.numel() for group in params_to_optimize for param in group["params"])
+        hf_logger.info("***** Running V-JEPA encoder pretrain *****")
+        hf_logger.info(f"  Dataset adapter = {config.dataset.name}")
+        hf_logger.info(f"  Model family = {config.model.family}")
+        hf_logger.info(f"  Pretrained model = {pretrained}")
+        hf_logger.info(f"  Num trainable parameters = {num_trainable_parameters}")
+        hf_logger.info(f"  Num examples = {len(train_dataset)}")
+        hf_logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+        hf_logger.info(f"  Num epochs = {num_train_epochs}")
+        hf_logger.info(f"  Total train batch size = {total_batch_size}")
+        hf_logger.info(f"  Total optimization steps = {max_train_steps}")
+
+        global_step = 0
+        progress_bar = tqdm(
+            range(max_train_steps),
+            initial=0,
+            desc="Steps",
+            disable=not accelerator.is_local_main_process,
+        )
+
+        for _ in range(num_train_epochs):
+            model.train()
+            for batch in train_dataloader:
+                with accelerator.accumulate(model):
+                    pixel_values_videos = batch["pixel_values_videos"].to(accelerator.device, dtype=weight_dtype)
+                    context_mask, target_mask = sample_vjepa_masks(
+                        batch_size=pixel_values_videos.shape[0],
+                        num_tokens=vjepa.num_tokens,
+                        mask_ratio=mask_ratio,
+                        device=pixel_values_videos.device,
+                    )
+                    outputs = model(
+                        pixel_values_videos=pixel_values_videos,
+                        context_mask=context_mask,
+                        target_mask=target_mask,
+                    )
+                    predicted_tokens = outputs.predictor_output.last_hidden_state
+                    target_tokens = outputs.predictor_output.target_hidden_state.detach()
+                    if normalize_targets:
+                        target_tokens = F.layer_norm(target_tokens, (target_tokens.shape[-1],))
+                    loss = F.smooth_l1_loss(predicted_tokens, target_tokens)
+                    accelerator.backward(loss)
+
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), training.max_grad_norm)
+                    if accelerator.state.deepspeed_plugin is None:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    lr_scheduler.step()
+
+                if accelerator.sync_gradients:
+                    global_step += 1
+                    progress_bar.update(1)
+                    if global_step % training.checkpointing_steps == 0:
+                        save_checkpoint(
+                            accelerator,
+                            output_dir,
+                            global_step,
+                            int(train_extra.get("checkpoints_total_limit", 0)),
+                        )
+
+                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
+                if global_step >= max_train_steps:
+                    break
+            if global_step >= max_train_steps:
+                break
+
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            save_vjepa_model(
+                accelerator=accelerator,
+                output_dir=output_dir,
+                model=model,
+                video_processor=video_processor,
+            )
+        accelerator.end_training()
+
 
 class CogVideoXManifestDataset:
     def __init__(
@@ -561,6 +796,72 @@ class CogVideoXManifestDataset:
         return videos
 
 
+class VJEPAPretrainDataset:
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        num_frames: int,
+        torch,
+        np,
+        tqdm,
+        dataset_cls=None,
+    ) -> None:
+        self.config = config
+        self.torch = torch
+        self.np = np
+        self.max_num_frames = int(config.model.extra.get("num_frames", num_frames))
+        self.skip_frames_start = int(config.training.extra.get("skip_frames_start", 0))
+        self.skip_frames_end = int(config.training.extra.get("skip_frames_end", 0))
+        self.random_horizontal_flip = bool(config.training.extra.get("random_horizontal_flip", False))
+        self.records = load_video_training_records(config, dataset_cls=dataset_cls)
+        self.instance_video_paths = [record.target_video for record in self.records]
+        self.instance_videos = self._preprocess_data(tqdm)
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        return {"video": self.instance_videos[index]}
+
+    def _preprocess_data(self, tqdm):
+        try:
+            import decord
+        except ImportError as exc:
+            raise ImportError("Install decord for V-JEPA pretraining: `pip install decord`.") from exc
+
+        decord.bridge.set_bridge("torch")
+        videos = []
+        progress = tqdm(range(len(self.instance_video_paths)), desc="Loading and resizing videos")
+
+        for filename in self.instance_video_paths:
+            if not filename.is_file():
+                raise FileNotFoundError(f"Target video not found: {filename}")
+            video_reader = decord.VideoReader(uri=filename.as_posix())
+            video_num_frames = len(video_reader)
+            start_frame = min(self.skip_frames_start, video_num_frames)
+            end_frame = max(0, video_num_frames - self.skip_frames_end)
+            if end_frame <= start_frame:
+                frames = video_reader.get_batch([start_frame])
+            elif end_frame - start_frame <= self.max_num_frames:
+                frames = video_reader.get_batch(list(range(start_frame, end_frame)))
+            else:
+                step = max(1, (end_frame - start_frame) // self.max_num_frames)
+                frames = video_reader.get_batch(list(range(start_frame, end_frame, step)))
+
+            frames = frames[: self.max_num_frames]
+            if frames.shape[0] < self.max_num_frames:
+                pad = frames[-1:].repeat(self.max_num_frames - frames.shape[0], 1, 1, 1)
+                frames = self.torch.cat([frames, pad], dim=0)
+
+            frames = frames.to(dtype=self.torch.uint8)
+            if self.random_horizontal_flip and self.np.random.rand() < 0.5:
+                frames = self.torch.flip(frames, dims=(2,))
+            videos.append(frames.contiguous())
+            progress.update(1)
+        progress.close()
+        return videos
+
+
 def pretrained_model_name_or_path(config: ExperimentConfig) -> str:
     return (
         config.model.extra.get("pretrained_model_name_or_path")
@@ -645,3 +946,26 @@ def flatten_config(config: ExperimentConfig) -> dict:
         "generation": config.generation.__dict__,
         "training": config.training.__dict__,
     }
+
+
+def sample_vjepa_masks(batch_size: int, num_tokens: int, mask_ratio: float, device: torch.device):
+    num_masked = max(1, int(num_tokens * mask_ratio))
+    noise = torch.rand(batch_size, num_tokens, device=device)
+    ids_shuffle = torch.argsort(noise, dim=1)
+    target_indices = torch.sort(ids_shuffle[:, :num_masked], dim=1).values
+    context_indices = torch.sort(ids_shuffle[:, num_masked:], dim=1).values
+    return [context_indices], [target_indices]
+
+
+def save_vjepa_model(accelerator, output_dir: Path, model, video_processor) -> None:
+    save_dir = output_dir / "final"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    unwrapped_model = accelerator.unwrap_model(model)
+    state_dict = accelerator.get_state_dict(model)
+    unwrapped_model.save_pretrained(
+        save_dir,
+        is_main_process=accelerator.is_main_process,
+        save_function=accelerator.save,
+        state_dict=state_dict,
+    )
+    video_processor.save_pretrained(save_dir)
