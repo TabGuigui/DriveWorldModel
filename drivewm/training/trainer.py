@@ -1,9 +1,4 @@
-"""Single DriveWorldModel trainer.
-
-The trainer reads dataset and model choices from ExperimentConfig. The first
-supported backend is CogVideoX LoRA; Wan and Hunyuan can be added here without
-adding another trainer abstraction.
-"""
+"""Config-driven training entrypoint."""
 
 from __future__ import annotations
 
@@ -50,15 +45,53 @@ class DriveWorldTrainer:
         self.dataset_cls = dataset_cls
 
     def train(self) -> None:
-        if self.config.model.family in {"vjepa", "vjepa-encoder"}:
-            self._train_vjepa_encoder_pretrain()
-            return
+        recipe = self._resolve_training_recipe()
+        recipe()
 
-        if self.config.model.family not in {"cogvideox", "cogvideox-1.5"}:
+    def _resolve_training_recipe(self):
+        recipes = {
+            "cogvideox": self._train_cogvideox_lora,
+            "cogvideox-1.5": self._train_cogvideox_lora,
+            "vjepa": self._train_vjepa_encoder_pretrain,
+            "vjepa-encoder": self._train_vjepa_encoder_pretrain,
+        }
+        family = self.config.model.family.strip().lower().replace("_", "-")
+        try:
+            return recipes[family]
+        except KeyError as exc:
+            available = ", ".join(sorted(recipes))
             raise ValueError(
-                "DriveWorldTrainer currently supports CogVideoX LoRA and Hugging Face V-JEPA encoder pretrain. "
-                f"Got model.family={self.config.model.family!r}."
+                f"Unsupported training model.family={self.config.model.family!r}. "
+                f"Available training families: {available}."
+            ) from exc
+
+    def _build_training_dataset(self, *, frames_per_clip: int | None = None):
+        family = self.config.model.family.strip().lower().replace("_", "-")
+        if family in {"cogvideox", "cogvideox-1.5"}:
+            return CogVideoXManifestDataset(
+                config=self.config,
+                torch=torch,
+                np=np,
+                transforms=TT,
+                resize_fn=resize,
+                interpolation_mode=InterpolationMode,
+                tqdm=tqdm,
+                dataset_cls=self.dataset_cls,
             )
+        if family in {"vjepa", "vjepa-encoder"}:
+            if frames_per_clip is None:
+                raise ValueError("frames_per_clip is required for V-JEPA dataset construction.")
+            return VJEPAPretrainDataset(
+                config=self.config,
+                num_frames=frames_per_clip,
+                torch=torch,
+                np=np,
+                tqdm=tqdm,
+                dataset_cls=self.dataset_cls,
+            )
+        raise ValueError(f"No dataset builder registered for model.family={self.config.model.family!r}.")
+
+    def _train_cogvideox_lora(self) -> None:
 
         config = self.config
         training = config.training
@@ -227,16 +260,7 @@ class DriveWorldTrainer:
                 weight_decay=float(train_extra.get("adam_weight_decay", training.weight_decay)),
             )
 
-        train_dataset = CogVideoXManifestDataset(
-            config=config,
-            torch=torch,
-            np=np,
-            transforms=TT,
-            resize_fn=resize,
-            interpolation_mode=InterpolationMode,
-            tqdm=tqdm,
-            dataset_cls=self.dataset_cls,
-        )
+        train_dataset = self._build_training_dataset()
 
         def encode_video(video):
             video = video.to(accelerator.device, dtype=vae.dtype).unsqueeze(0)
@@ -552,14 +576,7 @@ class DriveWorldTrainer:
                 weight_decay=float(train_extra.get("adam_weight_decay", training.weight_decay)),
             )
 
-        train_dataset = VJEPAPretrainDataset(
-            config=config,
-            num_frames=vjepa.frames_per_clip,
-            torch=torch,
-            np=np,
-            tqdm=tqdm,
-            dataset_cls=self.dataset_cls,
-        )
+        train_dataset = self._build_training_dataset(frames_per_clip=vjepa.frames_per_clip)
 
         def collate_fn(examples):
             pixel_values_videos = []
